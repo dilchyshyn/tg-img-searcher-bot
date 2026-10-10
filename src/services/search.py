@@ -1,5 +1,8 @@
 import asyncio
+import html
+import json
 import logging
+import re
 import time
 from dataclasses import dataclass
 
@@ -173,6 +176,64 @@ class DuckDuckGoProvider:
         return results
 
 
+class BingProvider:
+    """Власний парсер Bing Картинок: ~35 картинок за сторінку, без ключа і сторонніх бібліотек."""
+
+    name = "bing"
+    batch_size = 50
+    max_pages = 10
+    URL = "https://www.bing.com/images/async"
+    PAGE_SIZE = 35
+    HEADERS = {
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+            "(KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36"
+        ),
+        "Accept-Language": "uk,en;q=0.8",
+    }
+    # Кожна картинка — <a class="iusc" ... m="{JSON}">, розмір лежить поруч у "1049 × 1280"
+    _META_RE = re.compile(r'\sm="([^"]+)"')
+    _SIZE_RE = re.compile(r"(\d+)&#160;&#215;&#160;(\d+)")
+
+    def __init__(self, config: Config, session_factory) -> None:
+        self._config = config
+        self._session = session_factory
+
+    async def fetch_page(self, query: str, page_no: int) -> list[ImageResult]:
+        params = {
+            "q": query,
+            "first": page_no * self.PAGE_SIZE,
+            "count": self.PAGE_SIZE,
+            "adlt": "moderate" if self._config.safe_search else "off",
+        }
+        async with self._session().get(self.URL, params=params, headers=self.HEADERS) as resp:
+            if resp.status != 200:
+                raise SearchError(f"Bing {resp.status}: {resp.reason}")
+            text = await resp.text()
+
+        results = []
+        for block in text.split('class="iusc"')[1:]:
+            meta_match = self._META_RE.search(block)
+            if not meta_match:
+                continue
+            try:
+                meta = json.loads(html.unescape(meta_match.group(1)))
+            except ValueError:
+                continue
+            link = meta.get("murl")
+            if not link or not _looks_like_jpeg(link):
+                continue
+            size = self._SIZE_RE.search(block)
+            results.append(ImageResult(
+                url=link,
+                thumbnail_url=meta.get("turl") or link,
+                width=int(size.group(1)) if size else None,
+                height=int(size.group(2)) if size else None,
+                title=meta.get("t", ""),
+            ))
+        return results
+
+
 class ImageSearch:
     def __init__(self, config: Config) -> None:
         self._session: aiohttp.ClientSession | None = None
@@ -182,11 +243,10 @@ class ImageSearch:
             "google": lambda: GoogleProvider(config, self._get_session),
             "serpapi": lambda: SerpApiProvider(config, self._get_session),
             "duckduckgo": lambda: DuckDuckGoProvider(config),
+            "bing": lambda: BingProvider(config, self._get_session),
         }
-        # Основний провайдер першим, DuckDuckGo — запасним
-        self._providers = [providers[config.search_provider]()]
-        if config.duckduckgo_fallback and config.search_provider != "duckduckgo":
-            self._providers.append(providers["duckduckgo"]())
+        # Перший у списку — основний, решта — запасні по черзі
+        self._providers = [providers[name]() for name in config.search_providers]
         self._by_name = {p.name: p for p in self._providers}
 
     async def close(self) -> None:
@@ -208,7 +268,7 @@ class ImageSearch:
             provider, page_no, skip = self._parse_offset(offset)
             return await self._search_with(provider, query, page_no, skip)
 
-        # Перша сторінка: якщо основний провайдер упав або нічого не знайшов — пробуємо запасний
+        # Перша сторінка: якщо провайдер упав або нічого не знайшов — пробуємо наступний
         last_error: SearchError | None = None
         for provider in self._providers:
             try:

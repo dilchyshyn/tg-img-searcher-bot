@@ -5,7 +5,7 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-PROVIDERS = ("google", "serpapi", "duckduckgo")
+PROVIDERS = ("google", "serpapi", "duckduckgo", "bing")
 
 
 def _require(name: str) -> str:
@@ -25,27 +25,32 @@ def _bool(name: str, default: bool) -> bool:
 @dataclass(frozen=True)
 class Config:
     bot_token: str
-    search_provider: str
+    search_providers: tuple[str, ...]
     google_api_key: str
     google_cse_id: str
     serpapi_key: str
-    duckduckgo_fallback: bool
     safe_search: bool
     cache_time: int
 
 
 def load_config() -> Config:
-    provider = os.getenv("SEARCH_PROVIDER", "google").strip().lower()
-    if provider not in PROVIDERS:
-        raise RuntimeError(f"SEARCH_PROVIDER має бути одним із: {', '.join(PROVIDERS)}")
+    raw = os.getenv("SEARCH_PROVIDERS", "duckduckgo,bing")
+    providers = tuple(dict.fromkeys(p.strip().lower() for p in raw.split(",") if p.strip()))
+    if not providers:
+        raise RuntimeError("SEARCH_PROVIDERS не може бути порожнім")
+    unknown = [p for p in providers if p not in PROVIDERS]
+    if unknown:
+        raise RuntimeError(
+            f"Невідомі провайдери в SEARCH_PROVIDERS: {', '.join(unknown)}. "
+            f"Доступні: {', '.join(PROVIDERS)}"
+        )
 
     return Config(
         bot_token=_require("BOT_TOKEN"),
-        search_provider=provider,
-        google_api_key=_require("GOOGLE_API_KEY") if provider == "google" else "",
-        google_cse_id=_require("GOOGLE_CSE_ID") if provider == "google" else "",
-        serpapi_key=_require("SERPAPI_KEY") if provider == "serpapi" else "",
-        duckduckgo_fallback=_bool("DUCKDUCKGO_FALLBACK", True),
+        search_providers=providers,
+        google_api_key=_require("GOOGLE_API_KEY") if "google" in providers else "",
+        google_cse_id=_require("GOOGLE_CSE_ID") if "google" in providers else "",
+        serpapi_key=_require("SERPAPI_KEY") if "serpapi" in providers else "",
         safe_search=_bool("SAFE_SEARCH", True),
         cache_time=int(os.getenv("CACHE_TIME", "300")),
     )
