@@ -24,6 +24,13 @@ MAX_EXTRA_PAGES = 2
 # Telegram в inline показує лише JPEG, тому відкидаємо очевидно інші формати
 NON_JPEG_EXTENSIONS = (".png", ".gif", ".webp", ".svg", ".bmp", ".avif")
 
+# У сітці Telegram показує мініатюру, а при виборі сам завантажує оригінал.
+# Якщо сайт віддає 403, не JPEG чи файл понад 5 МБ — картинку не вдасться
+# надіслати, тому перевіряємо оригінали заздалегідь
+CHECK_TIMEOUT = 2.5
+MAX_PHOTO_SIZE = 5 * 1024 * 1024
+CHECK_HEADERS = {"User-Agent": "TelegramBot (like TwitterBot)"}
+
 
 @dataclass(frozen=True)
 class ImageResult:
@@ -343,7 +350,37 @@ class ImageSearch:
                          len(results) - len(kept), len(results), query)
             results = kept
 
+        sendable = await self._keep_sendable(results)
+        if len(sendable) < len(results):
+            log.info("%s: недоступних оригіналів %d з %d для %r", provider.name,
+                     len(results) - len(sendable), len(results), query)
+        results = sendable
+
         if len(self._cache) >= CACHE_MAX_SIZE:
             self._cache.clear()
         self._cache[key] = (time.monotonic(), results, had_results)
         return results, had_results
+
+    async def _keep_sendable(self, images: list[ImageResult]) -> list[ImageResult]:
+        """Лишає картинки, оригінал яких Telegram зможе завантажити. Усі перевіряються
+        паралельно; ті, що не встигли за CHECK_TIMEOUT, теж відкидаються."""
+        if not images:
+            return []
+        tasks = [asyncio.ensure_future(self._is_sendable(image.url)) for image in images]
+        done, pending = await asyncio.wait(tasks, timeout=CHECK_TIMEOUT)
+        for task in pending:
+            task.cancel()
+        return [image for image, task in zip(images, tasks) if task in done and task.result()]
+
+    async def _is_sendable(self, url: str) -> bool:
+        try:
+            async with self._get_session().get(url, headers=CHECK_HEADERS) as resp:
+                if resp.status != 200:
+                    return False
+                if resp.content_length and resp.content_length > MAX_PHOTO_SIZE:
+                    return False
+                # Сигнатура JPEG; читаємо лише початок файлу
+                return await resp.content.readexactly(3) == b"\xff\xd8\xff"
+        except Exception:
+            # Будь-яка помилка (мережа, некоректна адреса, обірване з'єднання) — не надішлеться
+            return False
