@@ -10,11 +10,16 @@ import aiohttp
 from ddgs import DDGS
 
 from src.config import Config
+from src.services.filters import is_russian
 
 log = logging.getLogger(__name__)
 
 CACHE_TTL = 600
 CACHE_MAX_SIZE = 1000
+
+# Якщо після фільтра на сторінці мало картинок — добираємо наступні сторінки
+MIN_RESULTS = 20
+MAX_EXTRA_PAGES = 2
 
 # Telegram в inline показує лише JPEG, тому відкидаємо очевидно інші формати
 NON_JPEG_EXTENSIONS = (".png", ".gif", ".webp", ".svg", ".bmp", ".avif")
@@ -27,6 +32,8 @@ class ImageResult:
     width: int | None
     height: int | None
     title: str
+    # Сторінка, на якій знайдено картинку
+    source_url: str = ""
 
 
 @dataclass(frozen=True)
@@ -93,6 +100,7 @@ class GoogleProvider:
                 width=_to_int(image.get("width")),
                 height=_to_int(image.get("height")),
                 title=item.get("title", ""),
+                source_url=image.get("contextLink", ""),
             ))
         return results
 
@@ -133,6 +141,7 @@ class SerpApiProvider:
                 width=_to_int(item.get("original_width")),
                 height=_to_int(item.get("original_height")),
                 title=item.get("title", ""),
+                source_url=item.get("link", ""),
             ))
         return results
 
@@ -172,6 +181,7 @@ class DuckDuckGoProvider:
                 width=_to_int(item.get("width")),
                 height=_to_int(item.get("height")),
                 title=item.get("title", ""),
+                source_url=item.get("url", ""),
             ))
         return results
 
@@ -230,14 +240,17 @@ class BingProvider:
                 width=int(size.group(1)) if size else None,
                 height=int(size.group(2)) if size else None,
                 title=meta.get("t", ""),
+                source_url=meta.get("purl", ""),
             ))
         return results
 
 
 class ImageSearch:
     def __init__(self, config: Config) -> None:
+        self._block_russian = config.block_russian
         self._session: aiohttp.ClientSession | None = None
-        self._cache: dict[tuple[str, str, int], tuple[float, list[ImageResult]]] = {}
+        # Значення: (час, відфільтровані картинки, чи була сторінка непорожньою до фільтра)
+        self._cache: dict[tuple[str, str, int], tuple[float, list[ImageResult], bool]] = {}
 
         providers = {
             "google": lambda: GoogleProvider(config, self._get_session),
@@ -291,29 +304,46 @@ class ImageSearch:
             raise SearchError(f"Некоректний offset: {offset!r}") from None
 
     async def _search_with(self, provider, query: str, page_no: int, skip: int) -> SearchPage:
-        page = await self._get_page(provider, query, page_no)
-        images = page[skip:skip + provider.batch_size]
+        images: list[ImageResult] = []
+        extra_pages = 0
+        while True:
+            page, had_results = await self._get_page(provider, query, page_no)
+            taken = page[skip:skip + provider.batch_size - len(images)]
+            images.extend(taken)
+            skip += len(taken)
 
-        if skip + provider.batch_size < len(page):
-            next_offset = f"{provider.name}:{page_no}:{skip + provider.batch_size}"
-        elif page and page_no + 1 < provider.max_pages:
-            next_offset = f"{provider.name}:{page_no + 1}:0"
-        else:
-            next_offset = ""
-        return SearchPage(images, next_offset)
+            # Порція заповнена, а на сторінці ще лишились картинки
+            if skip < len(page):
+                return SearchPage(images, f"{provider.name}:{page_no}:{skip}")
 
-    async def _get_page(self, provider, query: str, page_no: int) -> list[ImageResult]:
+            # Сторінка закінчилась: далі або кінець видачі, або наступна сторінка
+            if not had_results or page_no + 1 >= provider.max_pages:
+                return SearchPage(images, "")
+            page_no, skip = page_no + 1, 0
+            if len(images) >= MIN_RESULTS or extra_pages >= MAX_EXTRA_PAGES:
+                return SearchPage(images, f"{provider.name}:{page_no}:0")
+            extra_pages += 1
+
+    async def _get_page(self, provider, query: str, page_no: int) -> tuple[list[ImageResult], bool]:
         key = (provider.name, query.lower(), page_no)
         cached = self._cache.get(key)
         if cached and time.monotonic() - cached[0] < CACHE_TTL:
-            return cached[1]
+            return cached[1], cached[2]
 
         try:
             results = await provider.fetch_page(query, page_no)
         except (aiohttp.ClientError, asyncio.TimeoutError, ValueError) as e:
             raise SearchError(f"Помилка запиту до {provider.name}: {e!r}") from e
 
+        had_results = bool(results)
+        if self._block_russian:
+            kept = [r for r in results if not is_russian(r.title, r.url, r.source_url)]
+            if len(kept) < len(results):
+                log.info("%s: відфільтровано %d з %d для %r", provider.name,
+                         len(results) - len(kept), len(results), query)
+            results = kept
+
         if len(self._cache) >= CACHE_MAX_SIZE:
             self._cache.clear()
-        self._cache[key] = (time.monotonic(), results)
-        return results
+        self._cache[key] = (time.monotonic(), results, had_results)
+        return results, had_results

@@ -30,6 +30,7 @@ class Config:
     google_cse_id: str
     serpapi_key: str
     safe_search: bool
+    block_russian: bool
     cache_time: int
 
 
@@ -52,5 +53,6 @@ def load_config() -> Config:
         google_cse_id=_require("GOOGLE_CSE_ID") if "google" in providers else "",
         serpapi_key=_require("SERPAPI_KEY") if "serpapi" in providers else "",
         safe_search=_bool("SAFE_SEARCH", True),
+        block_russian=_bool("BLOCK_RUSSIAN", True),
         cache_time=int(os.getenv("CACHE_TIME", "300")),
     )
