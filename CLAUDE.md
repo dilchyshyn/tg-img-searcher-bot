@@ -18,6 +18,8 @@ docker compose up -d --build
 docker compose logs -f
 ```
 
+Автооновлення: `deploy/install-auto-update.sh` ставить systemd user-таймер, який кожні 2 хв запускає `deploy/auto-update.sh` (`git fetch` → fast-forward → `docker compose up -d --build`). Якщо в робочій копії є незакомічені зміни, оновлення пропускається. Логи: `journalctl --user -u tg-img-bot-update`.
+
 Тестів і лінтера в проєкті немає. Пошук можна перевірити без Telegram, викликавши `ImageSearch.search()` напряму (потрібен лише будь-який `BOT_TOKEN` у оточенні, бо `load_config()` його вимагає):
 
 ```bash
