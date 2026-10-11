@@ -30,6 +30,7 @@ NON_JPEG_EXTENSIONS = (".png", ".gif", ".webp", ".svg", ".bmp", ".avif")
 CHECK_TIMEOUT = 2.5
 MAX_PHOTO_SIZE = 5 * 1024 * 1024
 CHECK_HEADERS = {"User-Agent": "TelegramBot (like TwitterBot)"}
+SENDABLE_CACHE_MAX_SIZE = 20000
 
 
 @dataclass(frozen=True)
@@ -258,6 +259,8 @@ class ImageSearch:
         self._session: aiohttp.ClientSession | None = None
         # Значення: (час, відфільтровані картинки, чи була сторінка непорожньою до фільтра)
         self._cache: dict[tuple[str, str, int], tuple[float, list[ImageResult], bool]] = {}
+        # Результати перевірки оригіналів: url -> (час, чи можна надіслати)
+        self._sendable: dict[str, tuple[float, bool]] = {}
 
         providers = {
             "google": lambda: GoogleProvider(config, self._get_session),
@@ -312,24 +315,44 @@ class ImageSearch:
 
     async def _search_with(self, provider, query: str, page_no: int, skip: int) -> SearchPage:
         images: list[ImageResult] = []
+        # Оригінали перевіряються, поки завантажуються наступні сторінки, а чекаємо
+        # їх один раз у кінці — інакше затримка перевірки сумується посторінково
+        checks: list[asyncio.Task] = []
         extra_pages = 0
-        while True:
-            page, had_results = await self._get_page(provider, query, page_no)
-            taken = page[skip:skip + provider.batch_size - len(images)]
-            images.extend(taken)
-            skip += len(taken)
+        try:
+            while True:
+                page, had_results = await self._get_page(provider, query, page_no)
+                taken = page[skip:skip + provider.batch_size - len(images)]
+                images.extend(taken)
+                checks.extend(asyncio.ensure_future(self._is_sendable(image.url)) for image in taken)
+                skip += len(taken)
 
-            # Порція заповнена, а на сторінці ще лишились картинки
-            if skip < len(page):
-                return SearchPage(images, f"{provider.name}:{page_no}:{skip}")
+                # Порція заповнена, а на сторінці ще лишились картинки
+                if skip < len(page):
+                    next_offset = f"{provider.name}:{page_no}:{skip}"
+                    break
 
-            # Сторінка закінчилась: далі або кінець видачі, або наступна сторінка
-            if not had_results or page_no + 1 >= provider.max_pages:
-                return SearchPage(images, "")
-            page_no, skip = page_no + 1, 0
-            if len(images) >= MIN_RESULTS or extra_pages >= MAX_EXTRA_PAGES:
-                return SearchPage(images, f"{provider.name}:{page_no}:0")
-            extra_pages += 1
+                # Сторінка закінчилась: далі або кінець видачі, або наступна сторінка
+                if not had_results or page_no + 1 >= provider.max_pages:
+                    next_offset = ""
+                    break
+                page_no, skip = page_no + 1, 0
+                # Перевірки ще тривають, тож не рахуємо лише ті, що вже провалились
+                failed = sum(task.done() and not task.result() for task in checks)
+                if len(images) - failed >= MIN_RESULTS or extra_pages >= MAX_EXTRA_PAGES:
+                    next_offset = f"{provider.name}:{page_no}:0"
+                    break
+                extra_pages += 1
+        except BaseException:
+            for task in checks:
+                task.cancel()
+            raise
+
+        sendable = await self._keep_sendable(images, checks)
+        if len(sendable) < len(images):
+            log.info("%s: недоступних оригіналів %d з %d для %r", provider.name,
+                     len(images) - len(sendable), len(images), query)
+        return SearchPage(sendable, next_offset)
 
     async def _get_page(self, provider, query: str, page_no: int) -> tuple[list[ImageResult], bool]:
         key = (provider.name, query.lower(), page_no)
@@ -350,29 +373,32 @@ class ImageSearch:
                          len(results) - len(kept), len(results), query)
             results = kept
 
-        sendable = await self._keep_sendable(results)
-        if len(sendable) < len(results):
-            log.info("%s: недоступних оригіналів %d з %d для %r", provider.name,
-                     len(results) - len(sendable), len(results), query)
-        results = sendable
-
         if len(self._cache) >= CACHE_MAX_SIZE:
             self._cache.clear()
         self._cache[key] = (time.monotonic(), results, had_results)
         return results, had_results
 
-    async def _keep_sendable(self, images: list[ImageResult]) -> list[ImageResult]:
-        """Лишає картинки, оригінал яких Telegram зможе завантажити. Усі перевіряються
-        паралельно; ті, що не встигли за CHECK_TIMEOUT, теж відкидаються."""
-        if not images:
+    async def _keep_sendable(self, images: list[ImageResult], tasks: list[asyncio.Task]) -> list[ImageResult]:
+        """Лишає картинки, оригінал яких Telegram зможе завантажити (tasks — уже запущені
+        перевірки _is_sendable). Ті, що не встигли за CHECK_TIMEOUT, теж відкидаються."""
+        if not tasks:
             return []
-        tasks = [asyncio.ensure_future(self._is_sendable(image.url)) for image in images]
         done, pending = await asyncio.wait(tasks, timeout=CHECK_TIMEOUT)
         for task in pending:
             task.cancel()
         return [image for image, task in zip(images, tasks) if task in done and task.result()]
 
     async def _is_sendable(self, url: str) -> bool:
+        cached = self._sendable.get(url)
+        if cached and time.monotonic() - cached[0] < CACHE_TTL:
+            return cached[1]
+        ok = await self._check_original(url)
+        if len(self._sendable) >= SENDABLE_CACHE_MAX_SIZE:
+            self._sendable.clear()
+        self._sendable[url] = (time.monotonic(), ok)
+        return ok
+
+    async def _check_original(self, url: str) -> bool:
         try:
             async with self._get_session().get(url, headers=CHECK_HEADERS) as resp:
                 if resp.status != 200:
