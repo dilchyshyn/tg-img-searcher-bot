@@ -177,6 +177,40 @@ def test_redirected_original_replaced_by_final_url(make_search):
     assert [i.thumbnail_url for i in page.images] == [i.thumbnail_url for i in original]
 
 
+def hosted(host: str, count: int) -> list[ImageResult]:
+    return [ImageResult(f"https://{host}/{i}.jpg", f"https://thumb.example/{host}{i}", 100, 100, "cat")
+            for i in range(count)]
+
+
+def test_telegram_blocked_hosts_dropped_before_check(make_search):
+    page0 = hosted("images.meme-arsenal.com", 10) + hosted("www.meme-arsenal.com", 5) + images("ok", 5)
+    provider = FakeProvider("fake", [page0, images("next", 25)])
+    s = make_search(provider)
+    page = run(s.search("cat"))
+
+    assert not any("meme-arsenal" in u for u in urls(page))
+    assert not any("meme-arsenal" in u for u in s.checked)
+    # Лишилось 5 < MIN_RESULTS — добрано наступну сторінку
+    assert provider.calls == [0, 1]
+    assert len(page.images) == 30
+
+
+def test_redirect_to_blocked_host_dropped(make_search):
+    s = make_search(FakeProvider("fake", [images("a", 3)], max_pages=1))
+
+    async def check_original(url: str) -> str | None:
+        return "https://images.meme-arsenal.com/x.jpg" if url.endswith("a0.jpg") else url
+
+    s._check_original = check_original
+    page = run(s.search("cat"))
+    assert urls(page) == urls_of(images("a", 3)[1:])
+
+
+def test_similar_host_not_blocked(make_search):
+    page = run(make_search(FakeProvider("fake", [hosted("notmeme-arsenal.com", 3)], max_pages=1)).search("cat"))
+    assert len(page.images) == 3
+
+
 def test_check_results_cached_by_url(make_search):
     shared = images("same", 3)
     provider = FakeProvider("fake", [shared], max_pages=1)

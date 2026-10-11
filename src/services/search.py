@@ -5,6 +5,7 @@ import logging
 import re
 import time
 from dataclasses import dataclass, replace
+from urllib.parse import urlsplit
 
 import aiohttp
 from ddgs import DDGS
@@ -31,6 +32,11 @@ CHECK_TIMEOUT = 2.5
 MAX_PHOTO_SIZE = 5 * 1024 * 1024
 CHECK_HEADERS = {"User-Agent": "TelegramBot (like TwitterBot)"}
 SENDABLE_CACHE_MAX_SIZE = 20000
+
+# Сайти, які віддають картинки нам, але не серверам Telegram (sendPhoto за URL
+# повертає "failed to get HTTP URL content"), тож наша перевірка їх не відсіює.
+# Разом із піддоменами, напр. images.meme-arsenal.com
+TELEGRAM_BLOCKED_HOSTS = ("meme-arsenal.com",)
 
 
 @dataclass(frozen=True)
@@ -65,6 +71,14 @@ def _to_int(value) -> int | None:
 def _looks_like_jpeg(url: str) -> bool:
     path = url.split("?", 1)[0].lower()
     return not path.endswith(NON_JPEG_EXTENSIONS)
+
+
+def _telegram_can_fetch(url: str) -> bool:
+    try:
+        host = (urlsplit(url).hostname or "").lower()
+    except ValueError:
+        return False
+    return not any(host == h or host.endswith("." + h) for h in TELEGRAM_BLOCKED_HOSTS)
 
 
 class GoogleProvider:
@@ -373,6 +387,8 @@ class ImageSearch:
                          len(results) - len(kept), len(results), query)
             results = kept
 
+        results = [r for r in results if _telegram_can_fetch(r.url)]
+
         if len(self._cache) >= CACHE_MAX_SIZE:
             self._cache.clear()
         self._cache[key] = (time.monotonic(), results, had_results)
@@ -389,7 +405,7 @@ class ImageSearch:
         kept = []
         for image, task in zip(images, tasks):
             final_url = task.result() if task in done else None
-            if final_url:
+            if final_url and _telegram_can_fetch(final_url):
                 kept.append(image if final_url == image.url else replace(image, url=final_url))
         return kept
 
