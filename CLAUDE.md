@@ -18,11 +18,27 @@ docker compose up -d --build
 docker compose logs -f
 ```
 
-Автооновлення: `deploy/install-auto-update.sh` ставить systemd user-таймер, який кожні 2 хв запускає `deploy/auto-update.sh` (`git fetch` → fast-forward → `docker compose up -d --build`). Якщо в робочій копії є незакомічені зміни, оновлення пропускається. Логи: `journalctl --user -u tg-img-bot-update`. Отже, **push у `origin/main` = деплой у прод за ~2 хв**.
+Автооновлення: `deploy/install-auto-update.sh` ставить systemd user-таймер, який кожні 2 хв запускає `deploy/auto-update.sh` (`git fetch` → fast-forward → `docker compose up -d --build` → перевірка, що контейнер `running` і `RestartCount == 0` через 15 с). Якщо в робочій копії є незакомічені зміни, оновлення пропускається. Логи: `journalctl --user -u tg-img-bot-update`. Отже, **push у `origin/main` = деплой у прод за ~2 хв**.
+
+Відкат: перед збіркою поточний образ тегається як `telegram-img-bot:prev`. Якщо збірка впала (тести) або контейнер не стартує, скрипт повертає `:prev` і завершується з помилкою. Стан спроб лежить у `.git/auto-update-state` (`<sha> <кількість невдач>`): якщо впала збірка, робиться до 3 спроб (тимчасові збої мережі в `pip install` повторяться). Збій на старті не повторюється, бо кожна спроба на ~15 с замінює робочий бот зламаним. Далі таймер чекає нового коміту. Сповіщень немає, збої видно лише в журналі. `docker image prune` не чіпає `:prev`, бо той має тег.
 
 `aiohttp` не закріплений у `requirements.txt` — він приходить транзитивно з `aiogram`.
 
-Тестів і лінтера в проєкті немає. Пошук можна перевірити без Telegram, викликавши `ImageSearch.search()` напряму (потрібен лише будь-який `BOT_TOKEN` у оточенні, бо `load_config()` його вимагає):
+### Тести й лінтер
+
+```bash
+.venv/bin/pip install -r requirements-dev.txt
+.venv/bin/ruff check .
+.venv/bin/python -m pytest                                   # усі
+.venv/bin/python -m pytest tests/test_pagination.py -k offset  # окремі
+docker compose build                                         # те саме, що на сервері
+```
+
+Тести працюють без мережі: пагінацію перевіряють через фейковий провайдер і підмінений `ImageSearch._check_original`, парсер Bing — на збереженій відповіді `tests/fixtures/bing_cat.html` (якщо Bing змінить розмітку, оновіть фікстуру й очікувані значення в `test_bing.py`). Запитів до справжніх пошуковиків у тестах немає свідомо.
+
+`Dockerfile` має stage `test` (ruff + pytest), від якого залежить фінальний образ (через `COPY --from=test /tests-passed`, інакше BuildKit пропустить stage). Тож якщо тести падають, `docker compose up -d --build` в `auto-update.sh` завершується помилкою й контейнер не змінюється. Код у робочій копії при цьому вже новий (merge відбувся до збірки), тож прод оновиться лише з наступним виправним комітом або після повторних спроб, описаних вище. Помилку видно в `journalctl --user -u tg-img-bot-update`.
+
+Пошук можна перевірити вживу без Telegram, викликавши `ImageSearch.search()` напряму (потрібен лише будь-який `BOT_TOKEN` у оточенні, бо `load_config()` його вимагає):
 
 ```bash
 BOT_TOKEN=1:x SEARCH_PROVIDERS=bing .venv/bin/python -c "

@@ -1,6 +1,8 @@
 services:
   bot:
     build: .
+    # Явна назва, від неї залежить відкат у deploy/auto-update.sh (тег :prev)
+    image: telegram-img-bot:latest
     container_name: telegram-img-bot
     env_file: .env
     restart: unless-stopped
