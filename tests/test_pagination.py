@@ -40,9 +40,9 @@ def make_search(make_config):
         s._by_name = {p.name: p for p in providers}
         s.checked = []
 
-        async def check_original(url: str) -> bool:
+        async def check_original(url: str) -> str | None:
             s.checked.append(url)
-            return not any(marker in url for marker in bad)
+            return None if any(marker in url for marker in bad) else url
 
         s._check_original = check_original
         return s
@@ -152,14 +152,29 @@ def test_slow_checks_dropped(make_search, monkeypatch):
     monkeypatch.setattr(search_module, "CHECK_TIMEOUT", 0.05)
     s = make_search(FakeProvider("fake", [images("a", 2) + images("slow", 1)], max_pages=1))
 
-    async def check_original(url: str) -> bool:
+    async def check_original(url: str) -> str | None:
         if "slow" in url:
             await asyncio.sleep(1)
-        return True
+        return url
 
     s._check_original = check_original
     page = run(s.search("cat"))
     assert urls(page) == urls_of(images("a", 2))
+
+
+def test_redirected_original_replaced_by_final_url(make_search):
+    original = images("a", 2)
+    s = make_search(FakeProvider("fake", [original], max_pages=1))
+
+    async def check_original(url: str) -> str | None:
+        return url.replace("img.example", "cdn.example")
+
+    s._check_original = check_original
+    page = run(s.search("cat"))
+
+    assert urls(page) == [u.replace("img.example", "cdn.example") for u in urls_of(original)]
+    # Решта полів (мініатюра, розміри, заголовок) лишаються від провайдера
+    assert [i.thumbnail_url for i in page.images] == [i.thumbnail_url for i in original]
 
 
 def test_check_results_cached_by_url(make_search):

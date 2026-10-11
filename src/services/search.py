@@ -4,7 +4,7 @@ import json
 import logging
 import re
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 import aiohttp
 from ddgs import DDGS
@@ -259,8 +259,8 @@ class ImageSearch:
         self._session: aiohttp.ClientSession | None = None
         # Значення: (час, відфільтровані картинки, чи була сторінка непорожньою до фільтра)
         self._cache: dict[tuple[str, str, int], tuple[float, list[ImageResult], bool]] = {}
-        # Результати перевірки оригіналів: url -> (час, чи можна надіслати)
-        self._sendable: dict[str, tuple[float, bool]] = {}
+        # Результати перевірки оригіналів: url -> (час, кінцева адреса або None, якщо не надішлеться)
+        self._sendable: dict[str, tuple[float, str | None]] = {}
 
         providers = {
             "google": lambda: GoogleProvider(config, self._get_session),
@@ -386,27 +386,37 @@ class ImageSearch:
         done, pending = await asyncio.wait(tasks, timeout=CHECK_TIMEOUT)
         for task in pending:
             task.cancel()
-        return [image for image, task in zip(images, tasks) if task in done and task.result()]
+        kept = []
+        for image, task in zip(images, tasks):
+            final_url = task.result() if task in done else None
+            if final_url:
+                kept.append(image if final_url == image.url else replace(image, url=final_url))
+        return kept
 
-    async def _is_sendable(self, url: str) -> bool:
+    async def _is_sendable(self, url: str) -> str | None:
+        """Адреса, з якої Telegram зможе завантажити оригінал, або None."""
         cached = self._sendable.get(url)
         if cached and time.monotonic() - cached[0] < CACHE_TTL:
             return cached[1]
-        ok = await self._check_original(url)
+        final_url = await self._check_original(url)
         if len(self._sendable) >= SENDABLE_CACHE_MAX_SIZE:
             self._sendable.clear()
-        self._sendable[url] = (time.monotonic(), ok)
-        return ok
+        self._sendable[url] = (time.monotonic(), final_url)
+        return final_url
 
-    async def _check_original(self, url: str) -> bool:
+    async def _check_original(self, url: str) -> str | None:
         try:
             async with self._get_session().get(url, headers=CHECK_HEADERS) as resp:
                 if resp.status != 200:
-                    return False
+                    return None
                 if resp.content_length and resp.content_length > MAX_PHOTO_SIZE:
-                    return False
+                    return None
                 # Сигнатура JPEG; читаємо лише початок файлу
-                return await resp.content.readexactly(3) == b"\xff\xd8\xff"
+                if await resp.content.readexactly(3) != b"\xff\xd8\xff":
+                    return None
+                # Telegram може не йти за перенаправленнями (напр. www.meme-arsenal.com
+                # віддає 301 на images.meme-arsenal.com), тож віддаємо йому кінцеву адресу
+                return str(resp.url)
         except Exception:
             # Будь-яка помилка (мережа, некоректна адреса, обірване з'єднання) — не надішлеться
-            return False
+            return None
